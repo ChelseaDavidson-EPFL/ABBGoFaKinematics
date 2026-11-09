@@ -4,72 +4,78 @@ Computes the spatial Jacobian in the world frame and the subchain Jacobian ^3 J_
 """
 
 import numpy as np
-from models.screw import S_LIST, OMEGA, R_AXIS, M
-from models.dh import DH_TABLE, T_BASE, dh_transform
-from forward_kinematics import fk_poe, exp_twist, skew
+import sympy as sym
+from models.dh import dh_frames, dh_frames_symbolic
+from forward_kinematics import fk_poe
 from scipy.spatial.transform import Rotation as Rot
 
 
-def compute_world_jacobian(q, p_ref=None):
+def jacobian_0Jt(q):
     """
-    Computes the 6x6 geometric Jacobian J_0(q) expressed in the world frame,
-    following the course convention [v; w] (linear velocity stacked above angular).
+    6x6 geometric Jacobian J_0(q) in the world frame, [v; w] (linear on top).
+    Joint i turns about w_{k-1} through p_{k-1}, both read from the DH frames.
     """
-    # 1. Reference point: tool0 origin by default, or any world point p_ref
-    p_t = fk_poe(q)[:3, 3] if p_ref is None else np.asarray(p_ref, float)
-    
-    J_v = np.zeros((3, 6))
-    J_w = np.zeros((3, 6))
-    
-    # Cumulative transformation to track individual joint axis frames
-    T_cum = np.eye(4)
-    
-    for i in range(6):
-        # Transform initial axis orientation and point to current configuration
-        z_i = T_cum[:3, :3] @ OMEGA[i]
-        p_i = T_cum[:3, :3] @ R_AXIS[i] + T_cum[:3, 3]
-        
-        # Column components: v_i = z_i x (p_t - p_i), w_i = z_i (slide 27, Lec 5)
-        J_v[:, i] = np.cross(z_i, p_t - p_i)
-        J_w[:, i] = z_i
-        
-        # Update cumulative transformation for the next joint using your proven exp_twist
-        T_cum = T_cum @ exp_twist(S_LIST[:, i], q[i])
-        
-    return np.vstack([J_v, J_w])
+    F = dh_frames(q) # [0T0, 0T1, ..., 0T6]
+    # Reference point: tool0
+    p_t = F[6][:3, 3]
 
+    J = np.zeros((6, 6))
+    for k in range(6):
+        w_k, p_k = F[k][:3, 2], F[k][:3, 3]                # joint i+1 axis = w of frame k
+        J[:3, k] = np.cross(w_k, p_t - p_k)                # v_i = w_k x (p_t - o_k)
+        J[3:, k] = w_k                                     # w_i = w_k
+    return J
 
-def dh_frames(q):
-    """[0T0, 0T1, ..., 0T6]: standard-DH frames (after each DH row)."""
-    T, out = T_BASE.copy(), [T_BASE.copy()]
-    for i in range(6):
-        alpha, a, d, off = DH_TABLE[i]
-        T = T @ dh_transform(q[i] + off, d, a, alpha)
-        out.append(T.copy())
-    return out
- 
- 
-def compute_subchain_jacobian_3J5(q, point="O5"):
+def jacobian_0Jt_sym():
+    F = dh_frames_symbolic()
+    p_t = F[6][:3, 3]
+    
+    J = sym.zeros(6, 6)
+    for k in range(6):
+        w_k, p_k = F[k][:3, 2], F[k][:3, 3]                # joint i+1 axis = w of frame k
+        J[:3, k] = w_k.cross(p_t - p_k)                    # v_i = w_k x (p_t - o_k)
+        J[3:, k] = w_k                                     # w_i = w_k
+    return J
+
+def jacobian_3J5(q):
     """
-    ^3 J_5 (6x6, linear first): Jacobian of the point O5 = origin of DH frame 5
-    (point="O4": origin of DH frame 4 = intersection of axes 4 and 5), with both
-    blocks rotated into the DH frame 3:  ^3J_5 = blkdiag(R03^T, R03^T) ^0J_5.
+    ^3 J_5 (6x6, linear first): Jacobian of the point 5
     """
     F = dh_frames(q)
-    p = F[5][:3, 3] if point == "O5" else F[4][:3, 3]
-    R30 = F[3][:3, :3].T
-    J_0 = compute_world_jacobian(q, p_ref=p)
-    Z = np.zeros((3, 3))
-    return np.block([[R30, Z], [Z, R30]]) @ J_0
+    T03_inv = np.linalg.inv(F[3])
+    F3 = [T03_inv @ T for T in F] # Move all transform to joint 3
 
+    # Final point: joint 5
+    p_t = F3[5][:3, 3]
 
+    J = np.zeros((6, 6))
+    for k in range(6):
+        w_k, p_k = F3[k][:3, 2], F3[k][:3, 3]              # joint i+1 axis = w of frame k
+        J[:3, k] = np.cross(w_k, p_t - p_k)                # v_i = w_k x (p_t - o_k)
+        J[3:, k] = w_k                                     # w_i = w_k
+    return J
+
+def jacobian_3J5_sym():
+    F = dh_frames_symbolic()
+    R, p = F[3][:3, :3], F[3][:3, 3]
+    T03_inv = sym.eye(4)
+    T03_inv[:3, :3] = R.T; T03_inv[:3, 3] = -R.T * p
+    F3 = [sym.simplify(T03_inv * T) for T in F] # Move all transform to joint 3
+    p_t = F3[5][:3, 3]
+
+    J = sym.zeros(6, 6)
+    for k in range(6):
+        w_k, p_k = F3[k][:3, 2], F3[k][:3, 3]              # joint i+1 axis = w of frame k
+        J[:3, k] = w_k.cross(p_t - p_k)                    # v_i = w_k x (p_t - o_k)
+        J[3:, k] = w_k                                     # w_i = w_k
+    return J
 
 def validate_jacobian(q, eps=1e-6):
     """
     Central finite differences of PoE FK, in the WORLD frame (same frame as J_0):
     linear rows  = d p_t / d q_i,   angular rows = Log(R(q+e) R(q-e)^T) / (2 eps).
     """
-    J_analytical = compute_world_jacobian(q)
+    J_geometrical = jacobian_0Jt(q)
     J_numerical = np.zeros((6, 6))
 
     for i in range(6):
@@ -79,7 +85,7 @@ def validate_jacobian(q, eps=1e-6):
         Tp, Tm = fk_poe(q + e), fk_poe(q - e)
         J_numerical[:3, i] = (Tp[:3, 3] - Tm[:3, 3]) / (2 * eps)
         J_numerical[3:, i] = Rot.from_matrix(Tp[:3, :3] @ Tm[:3, :3].T).as_rotvec() / (2 * eps)
-    error = np.abs(J_analytical - J_numerical).max()
+    error = np.abs(J_geometrical - J_numerical).max()
     print(f"Jacobian validation error at config: {error:.2e}")
     return error < 1e-6
 
@@ -92,10 +98,23 @@ if __name__ == "__main__":
     print(q_test)
     
     print("\n--- World Jacobian J_0 ---")
-    print(compute_world_jacobian(q_test))
+    jacobian = jacobian_0Jt(q_test)
+    print(jacobian)
+    det_j = np.linalg.det(jacobian)
+    print("Determinant:", det_j)
     
     print("\n--- Subchain Jacobian ^3 J_5 ---")
-    print(compute_subchain_jacobian_3J5(q_test))
+    jacobian_3_to_5 = jacobian_3J5(q_test)
+    print(jacobian_3_to_5)
+    det_j35 = np.linalg.det(jacobian_3_to_5)
+    print("Determinant:", det_j35)
+
+    # Validate the 3J5
+    print("\n Are they equal?", "True" if abs(det_j - det_j35) < 1e-4 else "False")
     
     print("\nRunning Validation...")
     validate_jacobian(q_test)
+
+    # print(sym.pprint(jacobian_0Jt_sym()[:, :3]))
+    # print("....")
+    # print(sym.pprint(jacobian_3J5_sym()[:, :3]))
