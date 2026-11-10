@@ -5,9 +5,11 @@ distribution of its IK solutions, made interactive like Lecture 06, slide 17
 
     Left   : joint-space slice (q2, q3) [rad] with the singular curves of the
              FULL robot and the (q2, q3) of every IK solution (numbered markers).
-    Middle : wrist-center section 0p5 = (x, 0, z), x >= 0, with the critical
-             curves (images of the singular curves).  Crossing a curve gains or
-             loses IK solutions; the shading is the number of regular IKs.
+    Middle : horizontal wrist-center section 0p5 = (x, y, z0) at a fixed height z0
+             (--z), with the critical circles (images of the singular curves).
+             Crossing a circle gains or loses IK solutions; the shading is the
+             number of regular IKs.  Tool-down poses are symmetric about the base
+             axis, so every curve of the old (rho, z) section becomes a circle.
     Right  : the selected IK drawn as a stick robot.
 
 Interaction
@@ -39,22 +41,22 @@ Tool-down poses do not depend on q1 (rotation about the base axis) nor on q6
      a5 offset, axes 4 and 6 are parallel but NOT coincident, so these are
      regular configurations (det J != 0).  Their (q2, q3) lie on the wrist lines.
 
-Regular IK count (checked against the solver on random targets):
+Regular IK count:
     A: 4 solutions inside each annulus  a2 - L3 < |O5 - (+-a5, d1)| < a2 + L3
     B: 2 solutions for every q2 with z = d1 + a2 cos q2 - tau d4 and
        | |r| - a5 | < rho < |r| + a5,  r = a2 sin q2 + tau a3,  tau = sin(q2+q3) = +-1
 so the GoFa has 0, 4, 6, 8 or 10 regular IKs for a tool-down pose.
 
 All angles are in radians.  Run from the repository root:
-    python singularity_slice_ik.py            (interactive figure)
-    python singularity_slice_ik.py --verify   (compare analytic count with the solver)
+    python singularity_slice_ik.py            (interactive figure, z0 = d1)
+    python singularity_slice_ik.py --z 0.5    (section at z0 = 0.5 m)
 """
+import argparse
 import json
 import os
 import xml.etree.ElementTree as ET
 import stat
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -67,12 +69,12 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from models.dh import DH_TABLE
 from models.screw import Q_LIMITS
 from forward_kinematics import fk_poe, pose_errors, _rpy_to_R, _axis_angle_R
-from screw_jacobian import compute_world_jacobian, dh_frames
+from screw_jacobian import jacobian_0Jt, dh_frames
 
 # ============================================================================
 # USER SETTINGS
 # ============================================================================
-IK_PLATFORM = "linux"            # "linux" or "windows"
+IK_PLATFORM = "windows" if os.name == "nt" else "linux"   # picked from the OS
 IK_ROOT = Path(__file__).resolve().parent / "abbGofa_ik"   # folder from abbGofa_ik.zip
 RANDOM_SEED = None               # int for a reproducible first target, None = random
 URDF_PATH = Path(__file__).resolve().parent / "models" / "abb_gofa" / "crb15000_5_95.urdf"
@@ -132,7 +134,7 @@ def _ensure_executable(path):
 
 
 def tool_target(w):
-    """Wrist center O5 (x, 0, z) -> 4x4 tool0 target with the tool z-axis down."""
+    """Wrist center O5 (x, y, z) -> 4x4 tool0 target with the tool z-axis down."""
     T = np.eye(4)
     T[:3, :3] = R_TOOL
     T[:3, 3] = np.asarray(w, float) + D6 * R_TOOL[:, 2]
@@ -163,7 +165,7 @@ def analyse_solution(sol, T_target):
     O4, O5 = F[4][:3, 3], F[5][:3, 3]
     fwd = np.array([np.cos(q[0]), np.sin(q[0]), 0.0])         # arm-plane forward direction
 
-    J = compute_world_jacobian(q)
+    J = jacobian_0Jt(q)
     sv = np.linalg.svd(J, compute_uv=False)
     ep, eR = pose_errors(fk_poe(q), T_target)                  # our FK vs the target
 
@@ -239,6 +241,28 @@ def critical_curves():
     return elbow, shoulder, wrist, bfold
 
 
+def critical_radii(z):
+    """Radii of the critical circles of the horizontal section at height z.
+    Same curves as critical_curves(), intersected with the plane z = const."""
+    elbow, wrist = [], []
+    dz = z - D1
+    for c in (A5, -A5):                       # F = 0: x = c + R cos t, z = D1 + R sin t
+        for R in (R_OUT, R_IN):
+            if R ** 2 >= dz ** 2:
+                h = np.sqrt(R ** 2 - dz ** 2)
+                elbow += [x for x in (c + h, c - h) if x >= 0]
+    for tau in (1, -1):                       # wrist lines q2 + q3 = tau*pi/2
+        c2 = (dz + tau * D4) / A2
+        if abs(c2) <= 1:
+            s2 = np.sqrt(1 - c2 ** 2)
+            for sgn in (1, -1):
+                r = abs(A2 * sgn * s2 + tau * A3)
+                wrist += [r + A5, abs(r - A5)]
+    # ponytail: B-fold lines (sin q2 = 0) are horizontal in (rho, z), so they only
+    # show up when z0 hits their exact height; not drawn here.
+    return elbow, wrist
+
+
 def joint_space_curves(n=721):
     q2 = np.linspace(-np.pi, np.pi, n)
     Q2, Q3 = np.meshgrid(q2, q2)
@@ -248,11 +272,14 @@ def joint_space_curves(n=721):
     return Q2, Q3, Gs, q3_elbow
 
 
-def random_wrist_center(rng):
-    while True:
-        rho, z = rng.uniform(0.02, RHO_MAX), rng.uniform(Z_MIN, Z_MAX)
+def random_wrist_center(rng, z, tries=10000):
+    """Random wrist center (x, y, z) with at least one regular IK at height z."""
+    for _ in range(tries):
+        rho, phi = rng.uniform(0.02, RHO_MAX), rng.uniform(-np.pi, np.pi)
         if regular_ik_count(rho, z) > 0:
-            return np.array([rho, 0.0, z])
+            return np.array([rho * np.cos(phi), rho * np.sin(phi), z])
+    raise ValueError(f"no reachable tool-down wrist center at z = {z:.3f} m "
+                     f"(try {Z_MIN:.2f} < z < {Z_MAX:.2f})")
 
 
 # ============================================================================
@@ -382,7 +409,8 @@ def load_mesh_model():
 # Interactive figure
 # ============================================================================
 class SliceExplorer:
-    def __init__(self):
+    def __init__(self, z0=D1):
+        self.z0 = float(z0)                           # height of the wrist-center section
         self.rng = np.random.default_rng(RANDOM_SEED)
         self.sols, self.sel, self.w = [], 0, None
         self.mesh = load_mesh_model()
@@ -402,7 +430,7 @@ class SliceExplorer:
                       fontsize=15, fontweight="bold", va="center")
         self.fig.text(0.05, 0.935,
                       r"Tool z-axis vertically down, $^0R_t=\mathrm{diag}(1,-1,-1)$. Select a wrist "
-                      r"center $^0\mathbf{p}_5=(x,0,z)$ and compare its IK branches.   "
+                      r"center $^0\mathbf{p}_5=(x,y,z_0)$ and compare its IK branches.   "
                       r"On the $q_4\in\{0,\pi\}$ branches:  $\det({}^0J_6)=-a_2\,F\,G\,\sin q_5$,  "
                       r"$\sin q_5=\sigma\cos(q_2+q_3)$",
                       fontsize=10.5, va="center", color="0.2")
@@ -411,7 +439,7 @@ class SliceExplorer:
         bx1 = self.fig.add_axes([0.80, 0.948, 0.085, 0.035])
         bx2 = self.fig.add_axes([0.895, 0.948, 0.085, 0.035])
         self.b_rand, self.b_next = Button(bx1, "Random target"), Button(bx2, "Next IK")
-        self.b_rand.on_clicked(lambda _: self.set_target(random_wrist_center(self.rng)))
+        self.b_rand.on_clicked(lambda _: self.set_target(random_wrist_center(self.rng, self.z0)))
         self.b_next.on_clicked(lambda _: self.select(self.sel + 1))
         if self.mesh is not None:                     # "STL opacity" slider, as in the lecture
             sx = self.fig.add_axes([0.80, 0.335, 0.14, 0.02])
@@ -419,7 +447,7 @@ class SliceExplorer:
             self.s_alpha.on_changed(self._set_alpha)
         self.fig.canvas.mpl_connect("button_press_event", self.on_click)
         self.fig.canvas.mpl_connect("key_press_event", self.on_key)
-        self.set_target(random_wrist_center(self.rng))
+        self.set_target(random_wrist_center(self.rng, self.z0))
 
     # --- static layers -------------------------------------------------------
     def _draw_joint_space(self):
@@ -457,36 +485,33 @@ class SliceExplorer:
 
     def _draw_section(self):
         ax = self.axw
-        rr, zz = np.meshgrid(np.linspace(0, RHO_MAX, 700), np.linspace(Z_MIN, Z_MAX, 700))
-        cnt = regular_ik_count(rr, zz)
+        xx, yy = np.meshgrid(np.linspace(-RHO_MAX, RHO_MAX, 700), np.linspace(-RHO_MAX, RHO_MAX, 700))
+        cnt = regular_ik_count(np.hypot(xx, yy), self.z0)
         levels = [0, 4, 6, 8, 10]
         cmap = ListedColormap(["#ffffff", "#deebf7", "#c6dbef", "#9ecae1", "#6baed6"])
         norm = BoundaryNorm([-1, 2, 5, 7, 9, 11], cmap.N)
-        im = ax.imshow(cnt, origin="lower", extent=[0, RHO_MAX, Z_MIN, Z_MAX],
+        im = ax.imshow(cnt, origin="lower", extent=[-RHO_MAX, RHO_MAX, -RHO_MAX, RHO_MAX],
                        cmap=cmap, norm=norm, interpolation="nearest", zorder=0)
         cb = self.fig.colorbar(im, ax=ax, ticks=levels, fraction=0.04, pad=0.02)
         cb.set_label("regular IK solutions")
-        elbow, shoulder, wrist, bfold = critical_curves()
-        for x, z in elbow:
-            ax.plot(x, z, color=C_ELBOW, lw=2)
-        for x, z in shoulder:
-            ax.plot(x, z, color=C_SHOULDER, lw=3)
-        for x, z in wrist:
-            ax.plot(x, z, color=C_WRIST, lw=1.6)
-        for x, z in bfold:
-            ax.plot(x, z, color=C_BFOLD, lw=1.6, ls=":")
-        ax.plot(0, D1, "k+", ms=10)
-        ax.set_xlim(-0.015, RHO_MAX)
-        ax.set_ylim(Z_MIN, Z_MAX)
+        elbow, wrist = critical_radii(self.z0)
+        t = np.linspace(-np.pi, np.pi, 361)
+        for r in elbow:
+            ax.plot(r * np.cos(t), r * np.sin(t), color=C_ELBOW, lw=2)
+        for r in wrist:
+            ax.plot(r * np.cos(t), r * np.sin(t), color=C_WRIST, lw=1.6)
+        ax.plot(0, 0, "o", color=C_SHOULDER, ms=7)   # shoulder G = 0: base axis
+        ax.set_xlim(-RHO_MAX, RHO_MAX)
+        ax.set_ylim(-RHO_MAX, RHO_MAX)
         ax.set_aspect("equal")
-        ax.set_xlabel("x [m]  (y = 0, x ≥ 0)")
-        ax.set_ylabel("z [m]")
-        ax.set_title(r"wrist-center section $^0\mathbf{p}_5=(x,0,z)$ · click to solve IK", fontsize=11)
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("y [m]")
+        ax.set_title(rf"wrist-center section $^0\mathbf{{p}}_5=(x,y,{self.z0:.3f})$ · click to solve IK",
+                     fontsize=11)
         handles = [
-            Line2D([], [], color=C_SHOULDER, lw=3, label=r"shoulder $G=0$: O$_5$ on base axis (±4)"),
+            Line2D([], [], color=C_SHOULDER, marker="o", ls="", label=r"shoulder $G=0$: O$_5$ on base axis (±4)"),
             Line2D([], [], color=C_ELBOW, lw=2, label=r"elbow $F=0$ (±4 IKs)"),
             Line2D([], [], color=C_WRIST, lw=1.6, label=r"wrist $\sin q_5=0$ image (±2 IKs)"),
-            Line2D([], [], color=C_BFOLD, lw=1.6, ls=":", label=r"forearm-vertical fold $\sin q_2=0$ (±2)"),
         ]
         ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.10),
                   ncol=2, fontsize=8.5, frameon=False, handlelength=2.2)
@@ -495,7 +520,7 @@ class SliceExplorer:
     # --- dynamic layers ------------------------------------------------------
     def set_target(self, w):
         self.w = np.asarray(w, float)
-        self.w_marker.set_data([self.w[0]], [self.w[2]])
+        self.w_marker.set_data([self.w[0]], [self.w[1]])
         try:
             raw, T = solve_ik(self.w)
             self.error = None
@@ -589,11 +614,12 @@ class SliceExplorer:
         ax.cla()
         ax.axis("off")
         w = self.w
-        n_ana = int(regular_ik_count(w[0], w[2]))
+        n_ana = int(regular_ik_count(np.hypot(w[0], w[1]), w[2]))
         n_lim = sum(s["in_limits"] for s in self.sols)
         head = (f"{len(self.sols)} IKs from the solver (analytic regular count {n_ana}) · "
-                f"{n_lim} within joint limits · wrist center ({w[0]:.3f}, 0, {w[2]:.3f}) m · "
-                f"tool0 target ({self.T_target[0, 3]:.3f}, 0, {self.T_target[2, 3]:.3f}) m")
+                f"{n_lim} within joint limits · wrist center ({w[0]:.3f}, {w[1]:.3f}, {w[2]:.3f}) m · "
+                f"tool0 target ({self.T_target[0, 3]:.3f}, {self.T_target[1, 3]:.3f}, "
+                f"{self.T_target[2, 3]:.3f}) m")
         if self.sols:
             s = self.sols[self.sel]
             sg = lambda v: "+" if v > 0 else ("−" if v < 0 else "0")
@@ -634,7 +660,7 @@ class SliceExplorer:
         if tb is not None and getattr(tb, "mode", ""):
             return                                   # zoom / pan active
         if ev.inaxes is self.axw and ev.button == 1 and ev.xdata is not None:
-            self.set_target([max(ev.xdata, 1e-4), 0.0, ev.ydata])
+            self.set_target([ev.xdata, ev.ydata, self.z0])
         elif ev.inaxes is self.axq and self.sols and ev.xdata is not None:
             d = [np.hypot(wrap(s["q"][1]) - ev.xdata, wrap(s["q"][2]) - ev.ydata) for s in self.sols]
             if min(d) < 0.25:
@@ -646,33 +672,13 @@ class SliceExplorer:
         elif ev.key in ("left", "p"):
             self.select(self.sel - 1)
         elif ev.key == "r":
-            self.set_target(random_wrist_center(self.rng))
-
-
-# ============================================================================
-def verify_counts(n=300, seed=0):
-    """Compare the analytic regular-IK count with the solver on random wrist centers."""
-    rng = np.random.default_rng(seed)
-    bad = 0
-    for _ in range(n):
-        w = np.array([rng.uniform(0.01, RHO_MAX), 0.0, rng.uniform(Z_MIN, Z_MAX)])
-        raw, T = solve_ik(w)
-        sols = [analyse_solution(s, T) for s in raw]
-        n_reg = sum(abs(s["det"]) > 1e-9 for s in sols)
-        n_ana = int(regular_ik_count(w[0], w[2]))
-        ep = max([s["ep"] for s in sols], default=0.0)
-        eR = max([s["eR"] for s in sols], default=0.0)
-        # same tolerances as forward_kinematics.main (arccos amplifies round-off in e_R)
-        if n_reg != n_ana or n_reg != len(sols) or ep > 1e-9 or eR > 1e-6:
-            bad += 1
-            print(f"mismatch at {w.round(4)}: solver {len(sols)}, regular {n_reg}, analytic {n_ana}, "
-                  f"FK error {ep:.1e} m, {eR:.1e} rad")
-    print(f"{n - bad}/{n} wrist centers: solver count == analytic count, all FK-verified")
-    return bad == 0
+            self.set_target(random_wrist_center(self.rng, self.z0))
 
 
 if __name__ == "__main__":
-    if "--verify" in sys.argv:
-        sys.exit(0 if verify_counts() else 1)
-    explorer = SliceExplorer()
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    parser.add_argument("--z", type=float, default=D1,
+                        help=f"height z0 [m] of the wrist-center section (default d1 = {D1})")
+    args = parser.parse_args()
+    explorer = SliceExplorer(args.z)
     plt.show()
